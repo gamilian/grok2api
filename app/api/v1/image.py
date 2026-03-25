@@ -5,7 +5,7 @@ Image Generation API 路由
 import base64
 import time
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -42,7 +42,8 @@ ALLOWED_ASPECT_RATIOS = {"1:1", "2:3", "3:2", "9:16", "16:9"}
 class ImageGenerationRequest(BaseModel):
     """图片生成请求 - OpenAI 兼容"""
 
-    prompt: str = Field(..., description="图片描述")
+    prompt: Optional[str] = Field(None, description="图片描述")
+    input: Optional[Any] = Field(None, description="Responses-style input alias")
     model: Optional[str] = Field("grok-imagine-1.0", description="模型名称")
     n: Optional[int] = Field(1, ge=1, le=10, description="生成数量 (1-10)")
     size: Optional[str] = Field(
@@ -70,6 +71,64 @@ class ImageEditRequest(BaseModel):
     response_format: Optional[str] = Field(None, description="响应格式")
     style: Optional[str] = Field(None, description="风格 (暂不支持)")
     stream: Optional[bool] = Field(False, description="是否流式输出")
+
+
+def _extract_text_content(value: Any) -> str:
+    """Extract the last meaningful text payload from Responses-style input."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        role = value.get("role")
+        if role is not None or value.get("type") == "message":
+            return _extract_text_content(value.get("content"))
+
+        if value.get("type") in {"input_text", "text", "output_text"}:
+            text = value.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+            content = value.get("content")
+            if isinstance(content, str):
+                return content.strip()
+            return ""
+
+        if isinstance(value.get("text"), str):
+            return value["text"].strip()
+        return ""
+
+    if isinstance(value, list):
+        message_items = [
+            item
+            for item in value
+            if isinstance(item, dict)
+            and (item.get("role") is not None or item.get("type") == "message")
+        ]
+        if message_items:
+            for item in reversed(message_items):
+                role = item.get("role") or "user"
+                if role != "user":
+                    continue
+                text = _extract_text_content(item.get("content"))
+                if text:
+                    return text
+            return ""
+
+        parts: List[str] = []
+        for item in value:
+            text = _extract_text_content(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts).strip()
+
+    return str(value).strip()
+
+
+def resolve_generation_prompt(request: ImageGenerationRequest) -> str:
+    prompt = _extract_text_content(request.prompt)
+    if prompt:
+        return prompt
+    return _extract_text_content(request.input)
 
 
 def _validate_common_request(
@@ -127,6 +186,8 @@ def _validate_common_request(
 
 def validate_generation_request(request: ImageGenerationRequest):
     """验证图片生成请求参数"""
+    request.prompt = resolve_generation_prompt(request)
+
     if request.model != "grok-imagine-1.0":
         raise ValidationException(
             message="The model `grok-imagine-1.0` is required for image generation.",
@@ -245,6 +306,7 @@ async def _get_token(model: str):
     return token_mgr, token
 
 
+@router.post("/images/generations/responses")
 @router.post("/images/generations")
 async def create_image(request: ImageGenerationRequest):
     """

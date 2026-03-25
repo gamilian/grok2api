@@ -412,6 +412,7 @@ class ImageGenerationService:
         expected_per_call = 6
         calls_needed = max(1, int(math.ceil(n / expected_per_call)))
         calls_needed = min(calls_needed, n)
+        rate_limit_error: Optional[Exception] = None
 
         async def _fetch_batch(call_target: int, call_token: str):
             stream_retries = int(get_config("image.blocked_parallel_attempts") or 5) + 1
@@ -442,6 +443,8 @@ class ImageGenerationService:
         for batch in results:
             if isinstance(batch, Exception):
                 logger.warning(f"WS batch failed: {batch}")
+                if rate_limited(batch):
+                    rate_limit_error = batch
                 continue
             for img in batch:
                 if img not in seen:
@@ -502,6 +505,8 @@ class ImageGenerationService:
                 for batch in extra_results:
                     if isinstance(batch, Exception):
                         logger.warning(f"WS recovery batch failed: {batch}")
+                        if rate_limited(batch):
+                            rate_limit_error = batch
                         continue
                     for img in batch:
                         if img not in seen:
@@ -517,6 +522,8 @@ class ImageGenerationService:
                 )
 
         if len(all_images) < n:
+            if rate_limit_error:
+                raise rate_limit_error
             logger.error(
                 f"Image generation failed after recovery attempts: finals={len(all_images)}/{n}, "
                 f"blocked_parallel_attempts={int(get_config('image.blocked_parallel_attempts') or 5)}"
@@ -670,6 +677,20 @@ class ImageWSBaseProcessor(BaseProcessor):
             logger.warning(f"Image output failed: {e}")
             return ""
 
+    @staticmethod
+    def _raise_upstream_error(item: Dict) -> None:
+        message = item.get("error") or "Upstream error"
+        code = item.get("error_code") or "upstream_error"
+        status = item.get("status")
+        if code == "rate_limit_exceeded" or status == 429:
+            raise UpstreamException(
+                message,
+                details=item,
+                status_code=429,
+                code="rate_limit_exceeded",
+            )
+        raise UpstreamException(message, details=item)
+
 
 class ImageWSStreamProcessor(ImageWSBaseProcessor):
     """WebSocket image stream processor."""
@@ -715,7 +736,7 @@ class ImageWSStreamProcessor(ImageWSBaseProcessor):
                 code = item.get("error_code") or "upstream_error"
                 status = item.get("status")
                 if code == "rate_limit_exceeded" or status == 429:
-                    raise UpstreamException(message, details=item)
+                    self._raise_upstream_error(item)
                 yield self._sse(
                     "error",
                     {
@@ -936,8 +957,7 @@ class ImageWSCollectProcessor(ImageWSBaseProcessor):
 
         async for item in response:
             if item.get("type") == "error":
-                message = item.get("error") or "Upstream error"
-                raise UpstreamException(message, details=item)
+                self._raise_upstream_error(item)
             if item.get("type") != "image":
                 continue
             image_id = item.get("image_id")
